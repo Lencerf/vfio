@@ -4,6 +4,13 @@
 
 ## Added
 
+- `VfioContainer::new_from_fd()`, wrapping an opened VFIO container file
+  instead of opening `/dev/vfio/vfio`
+- `VfioDevice::new_from_group_fd()`, opening a device through an opened VFIO
+  group file and its name within the group, instead of discovering and
+  opening the group from the sysfs path of the device
+- `VfioError::GroupMetadata`
+
 ## Fixed
 
 - Keep a VFIO group bound to its container until the last device sharing it
