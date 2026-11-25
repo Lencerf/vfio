@@ -12,7 +12,9 @@ use std::io::{Read, Write};
 use std::mem::{self, ManuallyDrop};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::prelude::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(not(test), feature = "vfio_cdev"))]
+use std::path::PathBuf;
 #[cfg(feature = "vfio_cdev")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -428,10 +430,12 @@ impl VfioContainer {
         // Safe because there's no legal way to break the lock.
         let mut hash = self.groups.lock().unwrap();
 
-        // Clean up the group when the last user releases reference to the group, three reference
-        // count for:
-        // - one reference cloned in VfioDevice.drop() and passed into here
-        // - one reference held by the groups hashmap
+        // Clean up the group when the last user releases its reference to the group. At that
+        // point exactly two references are left:
+        // - the one held by the dropping VfioDevice and passed into here
+        // - the one held by the groups hashmap
+        // Any other VfioDevice sharing the group still holds its own reference, which keeps the
+        // count above two until that device is dropped in turn.
         if Arc::strong_count(&group) == 2 {
             #[cfg(any(feature = "kvm", feature = "mshv"))]
             match self.device_del_group(&group) {
@@ -1306,7 +1310,8 @@ pub struct VfioDevice {
     pub(crate) flags: u32,
     pub(crate) regions: Vec<VfioRegion>,
     pub(crate) irqs: HashMap<u32, VfioIrq>,
-    pub(crate) sysfspath: Option<PathBuf>,
+    /// The VFIO group the device belongs to, for devices opened through a legacy container.
+    pub(crate) group: Option<Arc<VfioGroup>>,
     pub(crate) vfio_ops: Arc<dyn VfioOps>,
     pub(crate) migration_data_fd: Mutex<Option<File>>,
     pub(crate) dma_logging_started: Mutex<bool>,
@@ -1418,12 +1423,13 @@ impl VfioDevice {
         sysfspath: &Path,
         vfio_ops: Arc<dyn VfioOps>,
         attach_ioas: bool,
-    ) -> Result<(VfioDeviceInfo, Option<u32>)> {
+    ) -> Result<(VfioDeviceInfo, Option<u32>, Option<Arc<VfioGroup>>)> {
         if let Some(vfio_container) = vfio_ops.as_any().downcast_ref::<VfioContainer>() {
             let group_id = Self::get_group_id_from_path(sysfspath)?;
             let group = vfio_container.get_group(group_id)?;
+            let device_info = group.get_device(sysfspath)?;
 
-            return Ok((group.get_device(sysfspath)?, None));
+            return Ok((device_info, None, Some(group)));
         }
 
         #[cfg(feature = "vfio_cdev")]
@@ -1446,7 +1452,7 @@ impl VfioDevice {
             let dev_info = VfioDeviceInfo::get_device_info(&device)?;
             let dev_info = VfioDeviceInfo::new(device, &dev_info);
 
-            return Ok((dev_info, Some(iommufd_dev_id)));
+            return Ok((dev_info, Some(iommufd_dev_id), None));
         }
 
         Err(VfioError::DowncastVfioOps)
@@ -1459,7 +1465,7 @@ impl VfioDevice {
     /// * `vfio_ops`: the vfio device wrapper object that the new VFIO device object will bind to.
     /// * `attach_ioas`: whether to attach the device to iommufd's IOAS
     pub fn new(sysfspath: &Path, vfio_ops: Arc<dyn VfioOps>, attach_ioas: bool) -> Result<Self> {
-        let (device_info, iommufd_dev_id) =
+        let (device_info, iommufd_dev_id, group) =
             Self::get_device_info(sysfspath, vfio_ops.clone(), attach_ioas)?;
         let regions = device_info.get_regions()?;
         let irqs = device_info.get_irqs()?;
@@ -1469,7 +1475,7 @@ impl VfioDevice {
             flags: device_info.flags,
             regions,
             irqs,
-            sysfspath: Some(sysfspath.to_path_buf()),
+            group,
             vfio_ops,
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
@@ -1513,7 +1519,7 @@ impl VfioDevice {
             flags: device_info.flags,
             regions,
             irqs,
-            sysfspath: None,
+            group: None,
             vfio_ops: vfio_iommufd,
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
@@ -2387,15 +2393,11 @@ impl Drop for VfioDevice {
                 ManuallyDrop::drop(&mut self.device);
             }
 
-            // VfioContainer always sets sysfspath, as it requires a sysfs path to get
-            // the group id and open the group file, so it is safe to unwrap here.
-            let sysfspath = self
-                .sysfspath
-                .as_deref()
-                .expect("VfioContainer requires a sysfs path");
-            let group_id = Self::get_group_id_from_path(sysfspath).unwrap();
-            let group = container.get_group(group_id).unwrap();
-            container.put_group(group);
+            // Release our reference to the group; the container drops the group once the last
+            // device using it is gone.
+            if let Some(group) = self.group.take() {
+                container.put_group(group);
+            }
         }
 
         #[cfg(feature = "vfio_cdev")]
@@ -2543,7 +2545,7 @@ mod tests {
             flags: 0,
             regions: device_info.get_regions().unwrap(),
             irqs: device_info.get_irqs().unwrap(),
-            sysfspath: Some(path.to_path_buf()),
+            group: None,
             vfio_ops: Arc::new(create_vfio_container()),
             migration_data_fd: Mutex::new(None),
             dma_logging_started: Mutex::new(false),
@@ -2964,6 +2966,28 @@ mod tests {
         unsafe { container.vfio_dma_map(0x2000, 0x2000, 0x8000 as _) }.unwrap_err();
         container.vfio_dma_unmap(0x1000, 0x1000).unwrap();
         container.vfio_dma_unmap(0x2000, 0x2000).unwrap_err();
+    }
+
+    #[test]
+    fn test_vfio_device_shared_group_drop() {
+        let container = Arc::new(create_vfio_container());
+        let dev0_file = TempFile::new().unwrap();
+        let dev1_file = TempFile::new().unwrap();
+
+        let dev0 = VfioDevice::new(dev0_file.as_path(), container.clone(), true).unwrap();
+        let dev1 = VfioDevice::new(dev1_file.as_path(), container.clone(), true).unwrap();
+
+        assert_eq!(container.groups.lock().unwrap().len(), 1);
+        let group = dev0.group.as_ref().unwrap();
+        assert!(Arc::ptr_eq(group, dev1.group.as_ref().unwrap()));
+        // One reference each in the groups table, dev0 and dev1.
+        assert_eq!(Arc::strong_count(group), 3);
+
+        // The group stays bound to the container until its last device is dropped.
+        drop(dev0);
+        assert_eq!(container.groups.lock().unwrap().len(), 1);
+        drop(dev1);
+        assert!(container.groups.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -6,6 +6,9 @@
 
 ## Fixed
 
+- Keep a VFIO group bound to its container until the last device sharing it
+  is dropped
+
 # [v0.10.1]
 
 ## Changed
